@@ -20,45 +20,68 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           CONF="/opt/devkitpro/pacman/etc/pacman.conf"
+
           if ! grep -Fq "[thepixellizeross-lib]" "$CONF"; then
-            printf '\n[thepixellizeross-lib]\nServer = https://thepixellizeross.gitlab.io/packages/any\nSigLevel = Optional\n' >> "$CONF"
+            cat >> "$CONF" <<'EOF'
+
+          [thepixellizeross-lib]
+          Server = https://thepixellizeross.gitlab.io/packages/any
+          SigLevel = Optional
+          EOF
           fi
+
           if ! grep -Fq "[thepixellizeross-linux]" "$CONF"; then
-            printf '\n[thepixellizeross-linux]\nServer = https://thepixellizeross.gitlab.io/packages/x86_64/linux\nSigLevel = Optional\n' >> "$CONF"
+            cat >> "$CONF" <<'EOF'
+
+          [thepixellizeross-linux]
+          Server = https://thepixellizeross.gitlab.io/packages/x86_64/linux
+          SigLevel = Optional
+          EOF
           fi
+
           dkp-pacman -Sy --noconfirm
-          dkp-pacman -S --noconfirm --needed libctrpf git
+          dkp-pacman -S --noconfirm --needed libctrpf
+
           echo "DEVKITPRO=/opt/devkitpro" >> "$GITHUB_ENV"
           echo "DEVKITARM=/opt/devkitpro/devkitARM" >> "$GITHUB_ENV"
 
-      - name: Create clean project
+      - name: Bootstrap 3DS Cast project
         shell: bash
         run: |
           set -euxo pipefail
-          rm -rf /tmp/ctrpf-template /tmp/3dscast
-          git clone --depth 1 --branch v0.8.0 https://github.com/PabloMK7/CTRPluginFramework-BlankTemplate.git /tmp/ctrpf-template
-          mkdir /tmp/3dscast
-          (cd /tmp/ctrpf-template && tar --exclude=.git --exclude=.github -cf - .) | (cd /tmp/3dscast && tar -xf -)
 
-          cd /tmp/3dscast
-          cat > CTRPluginFramework.plgInfo <<'EOF'
+          # Only bootstrap the source tree once.
+          if [ ! -f "Makefile" ]; then
+            git clone --depth 1 --branch v0.8.0 \
+              https://github.com/PabloMK7/CTRPluginFramework-BlankTemplate.git \
+              /tmp/ctrpf-template
+
+            # Copy the template without its Git metadata/workflows.
+            (
+              cd /tmp/ctrpf-template
+              tar --exclude=.git --exclude=.github -cf - .
+            ) | tar -xf -
+
+            cat > CTRPluginFramework.plgInfo <<'EOF'
           Author: 3DS Cast
 
           Version:
               Major: 0
               Minor: 1
-              Revision: 1
+              Revision: 0
 
           Targets:
 
           Title: 3DS Cast
 
-          Summary: Nintendo 3DS local screen streaming experiment
+          Summary: Stream Nintendo 3DS screens to a local web browser
 
           Description: |
-            Initial 3DS Cast plugin build.
-            This build validates CTRPluginFramework loading before streaming is enabled.
+            3DS Cast is an experimental Luma3DS 3GX plugin.
+            V0.1 establishes a clean CTRPluginFramework build base.
+            Screen capture and the local web streaming server will be added next.
 
           Compatibility: Any
 
@@ -66,31 +89,50 @@ jobs:
 
           UsePrivateMemory: false
           EOF
+          fi
 
       - name: Build plugin
         shell: bash
         run: |
           set -euxo pipefail
-          cd /tmp/3dscast
-
-          # Critical: do NOT override TARGET in the template Makefile.
-          # Its build system expects OUTPUT to match the working directory name.
           make clean || true
-          make -j1
+          make -j2
 
-          PLUGIN="$(find . -maxdepth 2 -type f -name '*.3gx' -print -quit)"
-          test -n "$PLUGIN"
+          echo "Generated files:"
+          find . -maxdepth 2 -type f \( -name "*.3gx" -o -name "*.elf" \) -print
 
-          mkdir -p "$GITHUB_WORKSPACE/release"
-          cp "$PLUGIN" "$GITHUB_WORKSPACE/release/3DS-Cast.3gx"
-          cp CTRPluginFramework.plgInfo "$GITHUB_WORKSPACE/release/CTRPluginFramework.plgInfo"
+          test -n "$(find . -maxdepth 2 -type f -name '*.3gx' -print -quit)"
 
-          ls -lh "$GITHUB_WORKSPACE/release"
+      - name: Save generated project files
+        shell: bash
+        run: |
+          set -euxo pipefail
 
-      - name: Upload plugin
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Makefile 3gx.ld CTRPluginFramework.plgInfo Includes Sources .gitignore 2>/dev/null || true
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Bootstrap 3DS Cast CTRPF project"
+            git push
+          else
+            echo "Project already bootstrapped; nothing to commit."
+          fi
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p release
+          find . -maxdepth 2 -type f -name "*.3gx" -exec cp {} release/3DS-Cast.3gx \;
+          cp CTRPluginFramework.plgInfo release/
+          test -f release/3DS-Cast.3gx
+
+      - name: Upload 3DS Cast artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 3DS-Cast-v0.1.1
+          name: 3DS-Cast-v0.1
           path: release/
           if-no-files-found: error
-          retention-days: 30
