@@ -1,4 +1,4 @@
-name: 3DS Cast Release Build
+name: 3DS Cast Patched CTRPF Build
 
 on:
   workflow_dispatch:
@@ -26,44 +26,57 @@ jobs:
           set -euxo pipefail
           apt-get update
           apt-get install -y --no-install-recommends \
-            git cmake g++ ca-certificates curl jq bzip2
+            git cmake g++ ca-certificates
 
-      - name: Install official CTRPluginFramework 0.8.0 binary
+      - name: Build CTRPluginFramework 0.8.0 with GCC compatibility patch
         shell: bash
         run: |
           set -euxo pipefail
 
-          API="https://gitlab.com/api/v4/projects/thepixellizeross%2Fctrpluginframework/releases/0.8.0"
+          rm -rf /tmp/ctrpf-src /tmp/ctrpf-dist
+          git clone --recursive --depth 1 --branch 0.8.0 \
+            https://gitlab.com/thepixellizeross/ctrpluginframework.git \
+            /tmp/ctrpf-src
 
-          curl -fL "$API" -o /tmp/ctrpf-release.json
+          cd /tmp/ctrpf-src/Library
 
-          echo "=== Release assets ==="
-          jq -r '.assets.links[]? | "\(.name) -> \(.direct_asset_url // .url)"' /tmp/ctrpf-release.json
+          echo "=== Before patch: Werror occurrences ==="
+          grep -RIn -- '-Werror' . || true
 
-          URL="$(
-            jq -r '
-              .assets.links[]?
-              | select(.name == "libctrpf-0.8.0.tar.bz2")
-              | (.direct_asset_url // .url)
-            ' /tmp/ctrpf-release.json \
-            | head -n1
-          )"
+          # Current devkitARM/GCC reports a few unused-but-set-variable warnings
+          # in CTRPF 0.8.0. The project enables -Werror, so those warnings abort
+          # the build. Keep all warnings, but do not promote this one class to
+          # an error.
+          MAKEFILE_CANDIDATES="$(find . -maxdepth 2 -type f \( -name 'Makefile' -o -name '*.mk' \) -print)"
+          PATCHED=0
 
-          test -n "$URL"
-          test "$URL" != "null"
+          for f in $MAKEFILE_CANDIDATES; do
+            if grep -q -- '-Werror' "$f"; then
+              sed -i 's/-Werror/-Werror -Wno-error=unused-but-set-variable/g' "$f"
+              PATCHED=1
+            fi
+          done
 
-          curl -fL "$URL" -o /tmp/libctrpf-0.8.0.tar.bz2
+          if [ "$PATCHED" -eq 0 ]; then
+            echo "Could not find -Werror in CTRPF build files."
+            exit 1
+          fi
 
-          rm -rf /tmp/libctrpf-unpack /opt/devkitpro/libctrpf
-          mkdir -p /tmp/libctrpf-unpack
-          tar -xjf /tmp/libctrpf-0.8.0.tar.bz2 -C /tmp/libctrpf-unpack
+          echo "=== After patch ==="
+          grep -RIn -- '-Werror' . || true
 
-          echo "=== Archive tree ==="
-          find /tmp/libctrpf-unpack -maxdepth 3 -type d -print
-          find /tmp/libctrpf-unpack -maxdepth 3 -type f -print | head -80
+          make clean || true
+          make -j1
+          make dist-bin
+
+          ARCHIVE="$(find . -maxdepth 2 -type f \( -name '*.tar.bz2' -o -name '*.tar.gz' -o -name '*.tar' \) -print -quit)"
+          test -n "$ARCHIVE"
+
+          mkdir -p /tmp/ctrpf-dist
+          tar -xf "$ARCHIVE" -C /tmp/ctrpf-dist
 
           ROOT="$(
-            find /tmp/libctrpf-unpack -type d -name include -printf '%h\n' \
+            find /tmp/ctrpf-dist -type d -name include -printf '%h\n' \
             | while read -r d; do
                 if [ -d "$d/lib" ]; then
                   echo "$d"
@@ -76,11 +89,9 @@ jobs:
           test -d "$ROOT/include"
           test -d "$ROOT/lib"
 
+          rm -rf /opt/devkitpro/libctrpf
           mkdir -p /opt/devkitpro/libctrpf
           cp -a "$ROOT/include" "$ROOT/lib" /opt/devkitpro/libctrpf/
-
-          echo "=== Installed libctrpf ==="
-          find /opt/devkitpro/libctrpf -maxdepth 3 -type f -print | head -80
 
           test -d /opt/devkitpro/libctrpf/include
           test -d /opt/devkitpro/libctrpf/lib
@@ -122,7 +133,7 @@ jobs:
           Version:
               Major: 0
               Minor: 1
-              Revision: 9
+              Revision: 10
 
           Targets:
 
@@ -132,7 +143,7 @@ jobs:
 
           Description: |
             Baseline 3GX build for 3DS Cast.
-            This version validates the plugin toolchain before streaming is added.
+            This build uses CTRPluginFramework 0.8.0 with a GCC compatibility patch.
 
           Compatibility: Any
 
@@ -147,7 +158,6 @@ jobs:
           set -euxo pipefail
 
           cd /tmp/3dscast
-
           make clean || true
           make -j1
 
@@ -166,7 +176,7 @@ jobs:
       - name: Upload plugin
         uses: actions/upload-artifact@v4
         with:
-          name: 3DS-Cast-v0.1.9
+          name: 3DS-Cast-v0.1.10
           path: release/
           if-no-files-found: error
           retention-days: 30
