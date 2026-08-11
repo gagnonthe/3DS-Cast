@@ -1,0 +1,461 @@
+name: 3DS Cast v0.2 HTTP Server
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitarm:20260610
+
+    env:
+      DEVKITPRO: /opt/devkitpro
+      DEVKITARM: /opt/devkitpro/devkitARM
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git cmake g++ ca-certificates
+
+      - name: Build CTRPluginFramework 0.8.0
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf /tmp/ctrpf-src /tmp/ctrpf-dist
+          git clone --recursive --depth 1 --branch 0.8.0 https://gitlab.com/thepixellizeross/ctrpluginframework.git /tmp/ctrpf-src
+          cd /tmp/ctrpf-src/Library
+          PATCHED=0
+          for f in $(find . -maxdepth 2 -type f \( -name 'Makefile' -o -name '*.mk' \) -print); do
+            if grep -q -- '-Werror' "$f"; then
+              sed -i 's/-Werror/-Werror -Wno-error=unused-but-set-variable/g' "$f"
+              PATCHED=1
+            fi
+          done
+          test "$PATCHED" -eq 1
+          make clean || true
+          make -j1
+          make dist-bin
+          ARCHIVE="$(find . -maxdepth 2 -type f \( -name '*.tar.bz2' -o -name '*.tar.gz' -o -name '*.tar' \) -print -quit)"
+          test -n "$ARCHIVE"
+          mkdir -p /tmp/ctrpf-dist
+          tar -xf "$ARCHIVE" -C /tmp/ctrpf-dist
+          ROOT="$(find /tmp/ctrpf-dist -type d -name include -printf '%h\n' | while read -r d; do if [ -d "$d/lib" ]; then echo "$d"; break; fi; done)"
+          test -n "$ROOT"
+          rm -rf /opt/devkitpro/libctrpf
+          mkdir -p /opt/devkitpro/libctrpf
+          cp -a "$ROOT/include" "$ROOT/lib" /opt/devkitpro/libctrpf/
+
+      - name: Build 3gxtool 1.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf /tmp/3gxtool
+          git clone --recursive --depth 1 --branch v1.3 https://gitlab.com/thepixellizeross/3gxtool.git /tmp/3gxtool
+          cmake -S /tmp/3gxtool -B /tmp/3gxtool/build
+          cmake --build /tmp/3gxtool/build -j2
+          test -x /tmp/3gxtool/build/3gxtool
+          install -m 0755 /tmp/3gxtool/build/3gxtool /usr/local/bin/3gxtool
+          command -v 3gxtool
+
+      - name: Prepare 3DS Cast v0.2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf /tmp/3dscast
+          git clone --depth 1 --branch v0.8.0 https://github.com/PabloMK7/CTRPluginFramework-BlankTemplate.git /tmp/3dscast
+          rm -rf /tmp/3dscast/.git /tmp/3dscast/.github
+
+          cat > /tmp/3dscast/CTRPluginFramework.plgInfo <<'EOF'
+          Author: 3DS Cast
+
+          Version:
+              Major: 0
+              Minor: 2
+              Revision: 0
+
+          Targets:
+
+          Title: 3DS Cast
+
+          Summary: Local web server for Nintendo 3DS games
+
+          Description: |
+            3DS Cast v0.2.
+            Starts a small HTTP server inside a game so another device on the
+            same network can connect through a browser.
+            Live screen streaming is not enabled yet.
+
+          Compatibility: Any
+
+          MemorySize: 5MiB
+
+          UsePrivateMemory: true
+          EOF
+
+          cat > /tmp/3dscast/Sources/main.cpp <<'EOF'
+          #include <3ds.h>
+          #include <CTRPluginFramework.hpp>
+          #include <arpa/inet.h>
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <malloc.h>
+          #include <netinet/in.h>
+          #include <sys/socket.h>
+          #include <unistd.h>
+          #include <cstdio>
+          #include <cstring>
+          #include <string>
+
+          namespace CTRPluginFramework
+          {
+              static const size_t SOC_ALIGN = 0x1000;
+              static const size_t SOC_BUFFER_SIZE = 0x100000;
+              static const u16 HTTP_PORT = 8080;
+
+              static volatile bool gStopRequested = false;
+              static volatile bool gServerRunning = false;
+              static volatile bool gServerReady = false;
+              static volatile int gLastError = 0;
+              static volatile u32 gHits = 0;
+
+              static u32 *gSocBuffer = nullptr;
+              static Thread gServerThread = nullptr;
+              static int gListenSocket = -1;
+
+              static const char kPage[] =
+                  "<!doctype html><html><head><meta charset='utf-8'>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>"
+                  "<title>3DS Cast</title><style>"
+                  "body{margin:0;background:#0b0c10;color:#fff;font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center}"
+                  ".card{width:min(88vw,520px);background:#17191f;border:1px solid #2a2d36;border-radius:22px;padding:24px;box-shadow:0 16px 60px #0008}"
+                  "h1{margin:12px 0 8px;font-size:30px}p{color:#b9becb;line-height:1.45}"
+                  ".ok{display:inline-block;background:#173d2a;color:#84f0ad;padding:8px 12px;border-radius:999px;font-weight:700}"
+                  ".screen{margin-top:18px;aspect-ratio:5/3;background:#050608;border:1px solid #2e323d;border-radius:14px;display:grid;place-items:center;color:#747b8c}"
+                  "</style></head><body><main class='card'><span class='ok'>Connected to 3DS</span>"
+                  "<h1>3DS Cast</h1><p>The HTTP server is running directly on your Nintendo 3DS.</p>"
+                  "<div class='screen'>Top-screen streaming comes next.</div></main></body></html>";
+
+              static bool SendAll(int sock, const char *data, size_t len)
+              {
+                  while (len > 0)
+                  {
+                      int sent = send(sock, data, len, 0);
+                      if (sent <= 0) return false;
+                      data += sent;
+                      len -= (size_t)sent;
+                  }
+                  return true;
+              }
+
+              static void SendResponse(int client, const char *status, const char *type, const char *body, size_t bodyLen)
+              {
+                  char header[256];
+                  int headerLen = std::snprintf(header, sizeof(header),
+                      "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
+                      "Connection: close\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                      status, type, (unsigned long)bodyLen);
+                  if (headerLen > 0)
+                  {
+                      SendAll(client, header, (size_t)headerLen);
+                      SendAll(client, body, bodyLen);
+                  }
+              }
+
+              static void HandleClient(int client)
+              {
+                  char request[1024];
+                  std::memset(request, 0, sizeof(request));
+                  int received = recv(client, request, sizeof(request) - 1, 0);
+                  if (received <= 0) return;
+                  ++gHits;
+
+                  if (std::strncmp(request, "GET /ping ", 10) == 0)
+                  {
+                      static const char pong[] = "{\"ok\":true,\"service\":\"3DS Cast\"}";
+                      SendResponse(client, "200 OK", "application/json; charset=utf-8", pong, sizeof(pong)-1);
+                      return;
+                  }
+
+                  if (std::strncmp(request, "GET /stats ", 11) == 0)
+                  {
+                      char json[160];
+                      int len = std::snprintf(json, sizeof(json),
+                          "{\"ok\":true,\"version\":\"0.2.0\",\"hits\":%lu,\"port\":%u}",
+                          (unsigned long)gHits, (unsigned int)HTTP_PORT);
+                      if (len > 0)
+                          SendResponse(client, "200 OK", "application/json; charset=utf-8", json, (size_t)len);
+                      return;
+                  }
+
+                  if (std::strncmp(request, "GET / ", 6) == 0)
+                  {
+                      SendResponse(client, "200 OK", "text/html; charset=utf-8", kPage, sizeof(kPage)-1);
+                      return;
+                  }
+
+                  static const char notFound[] = "3DS Cast: not found";
+                  SendResponse(client, "404 Not Found", "text/plain; charset=utf-8", notFound, sizeof(notFound)-1);
+              }
+
+              static void ServerThread(void *)
+              {
+                  gLastError = 0;
+                  gServerRunning = true;
+                  gServerReady = false;
+
+                  gSocBuffer = (u32*)memalign(SOC_ALIGN, SOC_BUFFER_SIZE);
+                  if (!gSocBuffer) { gLastError = -1001; gServerRunning = false; return; }
+
+                  Result rc = socInit(gSocBuffer, SOC_BUFFER_SIZE);
+                  if (R_FAILED(rc))
+                  {
+                      gLastError = (int)rc;
+                      free(gSocBuffer);
+                      gSocBuffer = nullptr;
+                      gServerRunning = false;
+                      return;
+                  }
+
+                  gListenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+                  if (gListenSocket < 0)
+                  {
+                      gLastError = errno ? errno : -1002;
+                      socExit();
+                      free(gSocBuffer);
+                      gSocBuffer = nullptr;
+                      gServerRunning = false;
+                      return;
+                  }
+
+                  int yes = 1;
+                  setsockopt(gListenSocket, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+                  sockaddr_in server;
+                  std::memset(&server, 0, sizeof(server));
+                  server.sin_family = AF_INET;
+                  server.sin_port = htons(HTTP_PORT);
+                  server.sin_addr.s_addr = gethostid();
+
+                  if (bind(gListenSocket, (sockaddr*)&server, sizeof(server)) < 0)
+                  {
+                      gLastError = errno ? errno : -1003;
+                      close(gListenSocket);
+                      gListenSocket = -1;
+                      socExit();
+                      free(gSocBuffer);
+                      gSocBuffer = nullptr;
+                      gServerRunning = false;
+                      return;
+                  }
+
+                  if (listen(gListenSocket, 4) < 0)
+                  {
+                      gLastError = errno ? errno : -1004;
+                      close(gListenSocket);
+                      gListenSocket = -1;
+                      socExit();
+                      free(gSocBuffer);
+                      gSocBuffer = nullptr;
+                      gServerRunning = false;
+                      return;
+                  }
+
+                  int flags = fcntl(gListenSocket, F_GETFL, 0);
+                  fcntl(gListenSocket, F_SETFL, flags | O_NONBLOCK);
+                  gServerReady = true;
+
+                  while (!gStopRequested)
+                  {
+                      sockaddr_in clientAddress;
+                      socklen_t clientLength = sizeof(clientAddress);
+                      int client = accept(gListenSocket, (sockaddr*)&clientAddress, &clientLength);
+                      if (client >= 0)
+                      {
+                          HandleClient(client);
+                          close(client);
+                      }
+                      else if (errno != EAGAIN && errno != EWOULDBLOCK)
+                      {
+                          gLastError = errno;
+                      }
+                      svcSleepThread(10 * 1000 * 1000LL);
+                  }
+
+                  gServerReady = false;
+                  if (gListenSocket >= 0) { close(gListenSocket); gListenSocket = -1; }
+                  socExit();
+                  if (gSocBuffer) { free(gSocBuffer); gSocBuffer = nullptr; }
+                  gServerRunning = false;
+              }
+
+              static void StartServer(MenuEntry *)
+              {
+                  if (gServerRunning || gServerThread != nullptr)
+                  {
+                      MessageBox("3DS Cast", "The HTTP server is already running.")();
+                      return;
+                  }
+
+                  gStopRequested = false;
+                  gServerReady = false;
+                  gLastError = 0;
+                  gHits = 0;
+
+                  gServerThread = threadCreate(ServerThread, nullptr, 0x10000, 0x30, -2, false);
+                  if (!gServerThread)
+                  {
+                      MessageBox("3DS Cast", "Could not create the server thread.")();
+                      return;
+                  }
+
+                  svcSleepThread(150 * 1000 * 1000LL);
+
+                  if (!gServerRunning)
+                  {
+                      std::string msg = "Server failed to start.\nError: ";
+                      msg += std::to_string((int)gLastError);
+                      threadJoin(gServerThread, U64_MAX);
+                      threadFree(gServerThread);
+                      gServerThread = nullptr;
+                      MessageBox("3DS Cast", msg)();
+                      return;
+                  }
+
+                  in_addr addr;
+                  addr.s_addr = gethostid();
+                  std::string msg = "Server started.\n\nOpen on your iPhone:\nhttp://";
+                  msg += inet_ntoa(addr);
+                  msg += ":";
+                  msg += std::to_string(HTTP_PORT);
+                  if (!gServerReady) msg += "\n\nServer is still initializing...";
+                  MessageBox("3DS Cast", msg)();
+              }
+
+              static void ShowInfo(MenuEntry *)
+              {
+                  std::string msg;
+                  if (!gServerRunning)
+                  {
+                      msg = "Server: stopped";
+                      if (gLastError != 0)
+                      {
+                          msg += "\nLast error: ";
+                          msg += std::to_string((int)gLastError);
+                      }
+                  }
+                  else
+                  {
+                      in_addr addr;
+                      addr.s_addr = gethostid();
+                      msg = "Server: ";
+                      msg += gServerReady ? "ready" : "starting";
+                      msg += "\nURL: http://";
+                      msg += inet_ntoa(addr);
+                      msg += ":";
+                      msg += std::to_string(HTTP_PORT);
+                      msg += "\nRequests: ";
+                      msg += std::to_string((unsigned long)gHits);
+                  }
+                  MessageBox("3DS Cast - Status", msg)();
+              }
+
+              static void StopServer(MenuEntry *)
+              {
+                  if (!gServerThread)
+                  {
+                      MessageBox("3DS Cast", "The server is already stopped.")();
+                      return;
+                  }
+
+                  gStopRequested = true;
+                  Result rc = threadJoin(gServerThread, 3ULL * 1000ULL * 1000ULL * 1000ULL);
+                  if (R_FAILED(rc))
+                  {
+                      MessageBox("3DS Cast", "Server did not stop in time.")();
+                      return;
+                  }
+
+                  threadFree(gServerThread);
+                  gServerThread = nullptr;
+                  MessageBox("3DS Cast", "HTTP server stopped.")();
+              }
+
+              void PatchProcess(FwkSettings &settings) { (void)settings; }
+
+              void OnProcessExit(void)
+              {
+                  gStopRequested = true;
+                  if (gServerThread)
+                  {
+                      if (R_SUCCEEDED(threadJoin(gServerThread, 2ULL * 1000ULL * 1000ULL * 1000ULL)))
+                          threadFree(gServerThread);
+                      gServerThread = nullptr;
+                  }
+              }
+
+              static void InitMenu(PluginMenu &menu)
+              {
+                  menu += new MenuEntry("Start HTTP server", nullptr, StartServer);
+                  menu += new MenuEntry("Connection / status", nullptr, ShowInfo);
+                  menu += new MenuEntry("Stop HTTP server", nullptr, StopServer);
+              }
+
+              int main(void)
+              {
+                  PluginMenu *menu = new PluginMenu(
+                      "3DS Cast", 0, 2, 0,
+                      "3DS Cast v0.2\nLocal HTTP server test.\nStreaming will be added after this networking test.");
+                  menu->SynchronizeWithFrame(true);
+                  InitMenu(*menu);
+                  menu->Run();
+                  delete menu;
+                  return 0;
+              }
+          }
+          EOF
+
+      - name: Build plugin
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /tmp/3dscast
+          make clean || true
+          make -j1
+          PLUGIN="$(find . -maxdepth 2 -type f -name '*.3gx' -print -quit)"
+          test -n "$PLUGIN"
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          cp "$PLUGIN" "$GITHUB_WORKSPACE/release/plugin.3gx"
+          cp CTRPluginFramework.plgInfo "$GITHUB_WORKSPACE/release/CTRPluginFramework.plgInfo"
+          cat > "$GITHUB_WORKSPACE/release/README.txt" <<'EOF'
+          3DS Cast v0.2
+          NETWORK TEST BUILD - no screen streaming yet.
+
+          In the 3DS Cast plugin menu:
+          1. Start HTTP server.
+          2. Note the URL.
+          3. Open that URL in Safari on an iPhone on the same local network.
+
+          Routes:
+          /       web page
+          /ping   connectivity test
+          /stats  server statistics
+          EOF
+          ls -lh "$GITHUB_WORKSPACE/release"
+
+      - name: Upload 3DS Cast v0.2
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3DS-Cast-v0.2.0
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
