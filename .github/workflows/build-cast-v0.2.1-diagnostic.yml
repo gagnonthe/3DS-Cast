@@ -1,4 +1,4 @@
-name: 3DS Cast v0.2.1 Diagnostic
+name: 3DS Cast v0.2.1 Diagnostic Fixed
 
 on:
   workflow_dispatch:
@@ -14,6 +14,7 @@ jobs:
     env:
       DEVKITPRO: /opt/devkitpro
       DEVKITARM: /opt/devkitpro/devkitARM
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,6 +33,7 @@ jobs:
           rm -rf /tmp/ctrpf-src /tmp/ctrpf-dist
           git clone --recursive --depth 1 --branch 0.8.0 https://gitlab.com/thepixellizeross/ctrpluginframework.git /tmp/ctrpf-src
           cd /tmp/ctrpf-src/Library
+
           PATCHED=0
           for f in $(find . -maxdepth 2 -type f \( -name 'Makefile' -o -name '*.mk' \) -print); do
             if grep -q -- '-Werror' "$f"; then
@@ -40,15 +42,20 @@ jobs:
             fi
           done
           test "$PATCHED" -eq 1
+
           make clean || true
           make -j1
           make dist-bin
+
           ARCHIVE="$(find . -maxdepth 2 -type f \( -name '*.tar.bz2' -o -name '*.tar.gz' -o -name '*.tar' \) -print -quit)"
           test -n "$ARCHIVE"
+
           mkdir -p /tmp/ctrpf-dist
           tar -xf "$ARCHIVE" -C /tmp/ctrpf-dist
+
           ROOT="$(find /tmp/ctrpf-dist -type d -name include -printf '%h\n' | while read -r d; do if [ -d "$d/lib" ]; then echo "$d"; break; fi; done)"
           test -n "$ROOT"
+
           rm -rf /opt/devkitpro/libctrpf
           mkdir -p /opt/devkitpro/libctrpf
           cp -a "$ROOT/include" "$ROOT/lib" /opt/devkitpro/libctrpf/
@@ -102,8 +109,14 @@ jobs:
 
           namespace CTRPluginFramework
           {
-              void PatchProcess(FwkSettings &settings) { (void)settings; }
-              void OnProcessExit(void) {}
+              void PatchProcess(FwkSettings &settings)
+              {
+                  (void)settings;
+              }
+
+              void OnProcessExit(void)
+              {
+              }
 
               static void ShowDiagnostic(MenuEntry *)
               {
@@ -119,19 +132,24 @@ jobs:
               static void InitMenu(PluginMenu &menu)
               {
                   menu += new MenuEntry(
+                      0,
                       "Diagnostic status",
-                      "Confirms that the plugin loaded correctly.",
-                      ShowDiagnostic);
+                      ShowDiagnostic,
+                      "Confirms that the plugin loaded correctly.");
               }
 
               int main(void)
               {
                   PluginMenu *menu = new PluginMenu(
-                      "3DS Cast", 0, 2, 1,
-                      "Diagnostic build.\nNo networking code is executed.");
+                      "3DS Cast",
+                      0, 2, 1,
+                      "Diagnostic build.\n"
+                      "No networking code is executed.");
+
                   menu->SynchronizeWithFrame(true);
                   InitMenu(*menu);
                   menu->Run();
+
                   delete menu;
                   return 0;
               }
@@ -145,17 +163,39 @@ jobs:
           cd /tmp/3dscast
           make clean || true
           make -j1
+
           PLUGIN="$(find . -maxdepth 2 -type f -name '*.3gx' -print -quit)"
           test -n "$PLUGIN"
+
           mkdir -p "$GITHUB_WORKSPACE/release"
           cp "$PLUGIN" "$GITHUB_WORKSPACE/release/default.3gx"
           cp CTRPluginFramework.plgInfo "$GITHUB_WORKSPACE/release/CTRPluginFramework.plgInfo"
+
+          cat > "$GITHUB_WORKSPACE/release/README.txt" <<'EOF'
+          3DS Cast v0.2.1 Diagnostic Fixed
+
+          Purpose:
+          - Verify that the plugin loads with private memory enabled.
+          - No networking code is executed.
+          - No sockets are opened.
+          - No custom worker thread is created.
+
+          Test:
+          1. Copy default.3gx to SD:/luma/plugins/
+          2. Enable Luma Plugin Loader.
+          3. Launch New Super Mario Bros. 2.
+          4. Press Select.
+          5. Open "Diagnostic status".
+
+          If this works without crashing, the previous crash came from the networking/thread code.
+          EOF
+
           ls -lh "$GITHUB_WORKSPACE/release"
 
       - name: Upload diagnostic plugin
         uses: actions/upload-artifact@v4
         with:
-          name: 3DS-Cast-v0.2.1-Diagnostic
+          name: 3DS-Cast-v0.2.1-Diagnostic-Fixed
           path: release/
           if-no-files-found: error
           retention-days: 30
