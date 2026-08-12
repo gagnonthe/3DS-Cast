@@ -1,4 +1,4 @@
-name: 3DS Cast v0.3.3 Threaded HTTP
+name: 3DS Cast v0.3.4 Network Diagnostic
 
 on:
   workflow_dispatch:
@@ -66,7 +66,7 @@ jobs:
           test -x /tmp/3gxtool/build/3gxtool
           install -m 0755 /tmp/3gxtool/build/3gxtool /usr/local/bin/3gxtool
 
-      - name: Prepare 3DS Cast v0.3.3
+      - name: Prepare 3DS Cast v0.3.4
         shell: bash
         run: |
           set -euxo pipefail
@@ -80,13 +80,13 @@ jobs:
           Version:
               Major: 0
               Minor: 3
-              Revision: 3
+              Revision: 4
 
           Targets:
 
-          Title: 3DS Cast Threaded HTTP
+          Title: 3DS Cast Network Diagnostic
 
-          Summary: Background HTTP server diagnostic
+          Summary: Background HTTP server with SD diagnostics
 
           Description: |
             Keeps the normal CTRPF lifecycle running while a separate worker
@@ -125,11 +125,29 @@ jobs:
               static int gServer = -1;
               static Thread gThread = nullptr;
 
+              static void WriteStatus(const char *label)
+              {
+                  FILE *f = std::fopen("sdmc:/3DS-Cast-status.txt", "w");
+                  if (!f) return;
+
+                  std::fprintf(
+                      f,
+                      "3DS Cast v0.3.4\\n"
+                      "stage=%d\\n"
+                      "error=%d\\n"
+                      "label=%s\\n",
+                      (int)gStage,
+                      (int)gLastError,
+                      label ? label : "unknown");
+
+                  std::fclose(f);
+              }
+
               static const char kPage[] =
                   "<!doctype html><html><head><meta charset='utf-8'>"
                   "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                   "<title>3DS Cast</title></head><body style='font-family:-apple-system;background:#111;color:white;padding:24px'>"
-                  "<h1>3DS Cast v0.3.3</h1><p>Background HTTP server is running.</p>"
+                  "<h1>3DS Cast v0.3.4</h1><p>Background HTTP server is running.</p>"
                   "<p>NSMB2 + CTRPF lifecycle + worker thread test: OK.</p></body></html>";
 
               static bool SendAll(int sock, const char *data, size_t len)
@@ -168,7 +186,7 @@ jobs:
                   {
                       char json[160];
                       int n = std::snprintf(json, sizeof(json),
-                          "{\"ok\":true,\"version\":\"0.3.3\",\"stage\":%d,\"error\":%d}",
+                          "{\"ok\":true,\"version\":\"0.3.4\",\"stage\":%d,\"error\":%d}",
                           (int)gStage, (int)gLastError);
                       if (n > 0) Reply(client, "application/json; charset=utf-8", json, (size_t)n);
                       return;
@@ -181,11 +199,19 @@ jobs:
               {
                   gStage = 1;
                   gLastError = 0;
+                  WriteStatus("worker-started");
 
                   gSocBuffer = (u32 *)memalign(SOC_ALIGN, SOC_BUFFER_SIZE);
-                  if (!gSocBuffer) { gLastError = -1001; gStage = -1; return; }
+                  if (!gSocBuffer)
+                  {
+                      gLastError = -1001;
+                      gStage = -1;
+                      WriteStatus("memalign-failed");
+                      return;
+                  }
 
                   gStage = 2;
+                  WriteStatus("before-socInit");
                   Result rc = socInit(gSocBuffer, SOC_BUFFER_SIZE);
                   if (R_FAILED(rc))
                   {
@@ -193,10 +219,12 @@ jobs:
                       free(gSocBuffer);
                       gSocBuffer = nullptr;
                       gStage = -2;
+                      WriteStatus("socInit-failed");
                       return;
                   }
 
                   gStage = 3;
+                  WriteStatus("socInit-ok");
                   gServer = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
                   if (gServer < 0)
                   {
@@ -205,6 +233,7 @@ jobs:
                       free(gSocBuffer);
                       gSocBuffer = nullptr;
                       gStage = -3;
+                      WriteStatus("socket-failed");
                       return;
                   }
 
@@ -218,6 +247,7 @@ jobs:
                   addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
                   gStage = 4;
+                  WriteStatus("socket-ok-before-bind");
                   if (bind(gServer, (sockaddr *)&addr, sizeof(addr)) < 0)
                   {
                       gLastError = errno;
@@ -227,10 +257,12 @@ jobs:
                       free(gSocBuffer);
                       gSocBuffer = nullptr;
                       gStage = -4;
+                      WriteStatus("bind-failed");
                       return;
                   }
 
                   gStage = 5;
+                  WriteStatus("bind-ok-before-listen");
                   if (listen(gServer, 2) < 0)
                   {
                       gLastError = errno;
@@ -240,12 +272,14 @@ jobs:
                       free(gSocBuffer);
                       gSocBuffer = nullptr;
                       gStage = -5;
+                      WriteStatus("listen-failed");
                       return;
                   }
 
                   int flags = fcntl(gServer, F_GETFL, 0);
                   fcntl(gServer, F_SETFL, flags | O_NONBLOCK);
                   gStage = 6;
+                  WriteStatus("server-ready");
 
                   while (!gStop)
                   {
@@ -321,7 +355,7 @@ jobs:
           cp "$PLUGIN" "$GITHUB_WORKSPACE/release/default.3gx"
           cp CTRPluginFramework.plgInfo "$GITHUB_WORKSPACE/release/CTRPluginFramework.plgInfo"
           cat > "$GITHUB_WORKSPACE/release/README.txt" <<'EOF'
-          3DS Cast v0.3.3 Threaded HTTP
+          3DS Cast v0.3.4 Threaded HTTP
 
           1. Note the 3DS IP in FTPD.
           2. Put default.3gx in SD:/luma/plugins/default.3gx
@@ -335,10 +369,10 @@ jobs:
           {"ok":true,"version":"0.3.3","stage":6,"error":0}
           EOF
 
-      - name: Upload 3DS Cast v0.3.3
+      - name: Upload 3DS Cast v0.3.4
         uses: actions/upload-artifact@v4
         with:
-          name: 3DS-Cast-v0.3.3-Threaded
+          name: 3DS-Cast-v0.3.4-Network-Diagnostic
           path: release/
           if-no-files-found: error
           retention-days: 30
