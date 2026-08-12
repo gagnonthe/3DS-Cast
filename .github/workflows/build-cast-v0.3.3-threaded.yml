@@ -1,6 +1,11 @@
-name: 3DS Cast v0.3.4 Network Diagnostic
+name: 3DS Cast v0.4 Artic Network
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-cast-v0.4-artic-network.yml"
   workflow_dispatch:
 
 permissions:
@@ -31,9 +36,14 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           rm -rf /tmp/ctrpf-src /tmp/ctrpf-dist
-          git clone --recursive --depth 1 --branch 0.8.0 https://gitlab.com/thepixellizeross/ctrpluginframework.git /tmp/ctrpf-src
+          git clone --recursive --depth 1 --branch 0.8.0 \
+            https://gitlab.com/thepixellizeross/ctrpluginframework.git \
+            /tmp/ctrpf-src
+
           cd /tmp/ctrpf-src/Library
+
           PATCHED=0
           for f in $(find . -maxdepth 2 -type f \( -name 'Makefile' -o -name '*.mk' \) -print); do
             if grep -q -- '-Werror' "$f"; then
@@ -42,14 +52,27 @@ jobs:
             fi
           done
           test "$PATCHED" -eq 1
+
           make clean || true
           make -j1
           make dist-bin
+
           ARCHIVE="$(find . -maxdepth 2 -type f \( -name '*.tar.bz2' -o -name '*.tar.gz' -o -name '*.tar' \) -print -quit)"
           test -n "$ARCHIVE"
+
           mkdir -p /tmp/ctrpf-dist
           tar -xf "$ARCHIVE" -C /tmp/ctrpf-dist
-          ROOT="$(find /tmp/ctrpf-dist -type d -name include -printf '%h\n' | while read -r d; do if [ -d "$d/lib" ]; then echo "$d"; break; fi; done)"
+
+          ROOT="$(
+            find /tmp/ctrpf-dist -type d -name include -printf '%h\n' \
+            | while read -r d; do
+                if [ -d "$d/lib" ]; then
+                  echo "$d"
+                  break
+                fi
+              done
+          )"
+
           test -n "$ROOT"
           rm -rf /opt/devkitpro/libctrpf
           mkdir -p /opt/devkitpro/libctrpf
@@ -59,19 +82,28 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           rm -rf /tmp/3gxtool
-          git clone --recursive --depth 1 --branch v1.3 https://gitlab.com/thepixellizeross/3gxtool.git /tmp/3gxtool
+          git clone --recursive --depth 1 --branch v1.3 \
+            https://gitlab.com/thepixellizeross/3gxtool.git \
+            /tmp/3gxtool
+
           cmake -S /tmp/3gxtool -B /tmp/3gxtool/build
           cmake --build /tmp/3gxtool/build -j2
+
           test -x /tmp/3gxtool/build/3gxtool
           install -m 0755 /tmp/3gxtool/build/3gxtool /usr/local/bin/3gxtool
 
-      - name: Prepare 3DS Cast v0.3.4
+      - name: Prepare 3DS Cast v0.4
         shell: bash
         run: |
           set -euxo pipefail
+
           rm -rf /tmp/3dscast
-          git clone --depth 1 --branch v0.8.0 https://github.com/PabloMK7/CTRPluginFramework-BlankTemplate.git /tmp/3dscast
+          git clone --depth 1 --branch v0.8.0 \
+            https://github.com/PabloMK7/CTRPluginFramework-BlankTemplate.git \
+            /tmp/3dscast
+
           rm -rf /tmp/3dscast/.git /tmp/3dscast/.github
 
           cat > /tmp/3dscast/CTRPluginFramework.plgInfo <<'EOF'
@@ -79,18 +111,19 @@ jobs:
 
           Version:
               Major: 0
-              Minor: 3
-              Revision: 4
+              Minor: 4
+              Revision: 0
 
           Targets:
 
-          Title: 3DS Cast Network Diagnostic
+          Title: 3DS Cast
 
-          Summary: Background HTTP server with SD diagnostics
+          Summary: Artic-style background HTTP server
 
           Description: |
-            Keeps the normal CTRPF lifecycle running while a separate worker
-            thread tests the HTTP server on port 8080.
+            Network test based on the socket/thread architecture used by
+            Artic Base Server.
+            Do not open the CTRPF menu during this test.
 
           Compatibility: Any
 
@@ -102,6 +135,7 @@ jobs:
           cat > /tmp/3dscast/Sources/main.cpp <<'EOF'
           #include <3ds.h>
           #include <CTRPluginFramework.hpp>
+
           #include <arpa/inet.h>
           #include <errno.h>
           #include <fcntl.h>
@@ -109,231 +143,420 @@ jobs:
           #include <netinet/in.h>
           #include <sys/socket.h>
           #include <unistd.h>
+
           #include <cstdio>
           #include <cstring>
 
           namespace CTRPluginFramework
           {
+              // Match Artic Base Server's proven SOC allocation.
               static const size_t SOC_ALIGN = 0x1000;
-              static const size_t SOC_BUFFER_SIZE = 0x100000;
+              static const size_t SOC_BUFFER_SIZE = 0x400000;
               static const u16 HTTP_PORT = 8080;
 
-              static volatile bool gStop = false;
+              static volatile bool gShouldRun = true;
               static volatile int gStage = 0;
               static volatile int gLastError = 0;
+
+              static int gListenFd = -1;
+              static int gAcceptFd = -1;
               static u32 *gSocBuffer = nullptr;
-              static int gServer = -1;
-              static Thread gThread = nullptr;
+              static Thread gServerThread = nullptr;
 
-              static void WriteStatus(const char *label)
+              static const char kIndex[] =
+                  "<!doctype html><html><head>"
+                  "<meta charset='utf-8'>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<title>3DS Cast</title>"
+                  "<style>"
+                  "body{margin:0;background:#0b0c10;color:#fff;font-family:-apple-system,BlinkMacSystemFont,sans-serif;"
+                  "display:flex;min-height:100vh;align-items:center;justify-content:center}"
+                  ".card{width:min(88vw,520px);background:#17191f;border:1px solid #2a2d36;border-radius:22px;padding:24px}"
+                  ".ok{display:inline-block;background:#173d2a;color:#84f0ad;padding:8px 12px;border-radius:999px;font-weight:700}"
+                  "h1{margin:14px 0 8px}p{color:#b9becb;line-height:1.45}"
+                  "</style></head><body><main class='card'>"
+                  "<span class='ok'>Connected to 3DS</span>"
+                  "<h1>3DS Cast v0.4</h1>"
+                  "<p>Artic-style network server is running while the game is active.</p>"
+                  "</main></body></html>";
+
+              static bool SetNonBlocking(int fd)
               {
-                  FILE *f = std::fopen("sdmc:/3DS-Cast-status.txt", "w");
-                  if (!f) return;
+                  int flags = fcntl(fd, F_GETFL, 0);
+                  if (flags < 0)
+                      return false;
 
-                  std::fprintf(
-                      f,
-                      "3DS Cast v0.3.4\\n"
-                      "stage=%d\\n"
-                      "error=%d\\n"
-                      "label=%s\\n",
-                      (int)gStage,
-                      (int)gLastError,
-                      label ? label : "unknown");
-
-                  std::fclose(f);
+                  return fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0;
               }
 
-              static const char kPage[] =
-                  "<!doctype html><html><head><meta charset='utf-8'>"
-                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                  "<title>3DS Cast</title></head><body style='font-family:-apple-system;background:#111;color:white;padding:24px'>"
-                  "<h1>3DS Cast v0.3.4</h1><p>Background HTTP server is running.</p>"
-                  "<p>NSMB2 + CTRPF lifecycle + worker thread test: OK.</p></body></html>";
-
-              static bool SendAll(int sock, const char *data, size_t len)
+              static bool SendAll(int fd, const char *data, size_t len)
               {
-                  while (len)
+                  while (len > 0)
                   {
-                      int sent = send(sock, data, len, 0);
-                      if (sent <= 0) return false;
-                      data += sent;
-                      len -= (size_t)sent;
+                      int sent = send(fd, data, len, 0);
+                      if (sent > 0)
+                      {
+                          data += sent;
+                          len -= static_cast<size_t>(sent);
+                          continue;
+                      }
+
+                      if (sent < 0 && (errno == EWOULDBLOCK || errno == EAGAIN))
+                      {
+                          svcSleepThread(2 * 1000 * 1000LL);
+                          continue;
+                      }
+
+                      return false;
                   }
+
                   return true;
               }
 
-              static void Reply(int client, const char *type, const char *body, size_t len)
+              static void SendResponse(
+                  int fd,
+                  const char *contentType,
+                  const char *body,
+                  size_t bodyLength)
               {
                   char header[256];
-                  int n = std::snprintf(header, sizeof(header),
-                      "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
-                      type, (unsigned long)len);
-                  if (n > 0)
-                  {
-                      SendAll(client, header, (size_t)n);
-                      SendAll(client, body, len);
-                  }
+
+                  int headerLength = std::snprintf(
+                      header,
+                      sizeof(header),
+                      "HTTP/1.1 200 OK\r\n"
+                      "Content-Type: %s\r\n"
+                      "Content-Length: %lu\r\n"
+                      "Connection: close\r\n"
+                      "Cache-Control: no-store\r\n\r\n",
+                      contentType,
+                      static_cast<unsigned long>(bodyLength));
+
+                  if (headerLength <= 0)
+                      return;
+
+                  SendAll(fd, header, static_cast<size_t>(headerLength));
+                  SendAll(fd, body, bodyLength);
               }
 
-              static void HandleClient(int client)
+              static void HandleClient(int fd)
               {
-                  char req[512];
-                  std::memset(req, 0, sizeof(req));
-                  int got = recv(client, req, sizeof(req) - 1, 0);
-                  if (got <= 0) return;
+                  char request[768];
+                  std::memset(request, 0, sizeof(request));
 
-                  if (std::strncmp(req, "GET /status ", 12) == 0)
+                  for (;;)
                   {
-                      char json[160];
-                      int n = std::snprintf(json, sizeof(json),
-                          "{\"ok\":true,\"version\":\"0.3.4\",\"stage\":%d,\"error\":%d}",
-                          (int)gStage, (int)gLastError);
-                      if (n > 0) Reply(client, "application/json; charset=utf-8", json, (size_t)n);
+                      int received = recv(fd, request, sizeof(request) - 1, 0);
+
+                      if (received > 0)
+                          break;
+
+                      if (received < 0 && (errno == EWOULDBLOCK || errno == EAGAIN))
+                      {
+                          if (!gShouldRun)
+                              return;
+
+                          svcSleepThread(2 * 1000 * 1000LL);
+                          continue;
+                      }
+
                       return;
                   }
 
-                  Reply(client, "text/html; charset=utf-8", kPage, sizeof(kPage) - 1);
+                  if (std::strncmp(request, "GET /status ", 12) == 0)
+                  {
+                      char json[192];
+
+                      int length = std::snprintf(
+                          json,
+                          sizeof(json),
+                          "{\"ok\":true,\"version\":\"0.4.0\",\"stage\":%d,\"error\":%d}",
+                          static_cast<int>(gStage),
+                          static_cast<int>(gLastError));
+
+                      if (length > 0)
+                      {
+                          SendResponse(
+                              fd,
+                              "application/json; charset=utf-8",
+                              json,
+                              static_cast<size_t>(length));
+                      }
+
+                      return;
+                  }
+
+                  SendResponse(
+                      fd,
+                      "text/html; charset=utf-8",
+                      kIndex,
+                      sizeof(kIndex) - 1);
               }
 
-              static void ServerWorker(void *)
+              // Networking loop intentionally follows Artic Base Server's
+              // structure closely: 4 MiB SOC buffer, initial 500 ms wait,
+              // recreate listener after failures, non-blocking socket,
+              // EWOULDBLOCK accept loop.
+              static void StartServer(void *)
               {
                   gStage = 1;
                   gLastError = 0;
-                  WriteStatus("worker-started");
 
-                  gSocBuffer = (u32 *)memalign(SOC_ALIGN, SOC_BUFFER_SIZE);
+                  gSocBuffer = static_cast<u32 *>(
+                      memalign(SOC_ALIGN, SOC_BUFFER_SIZE));
+
                   if (!gSocBuffer)
                   {
                       gLastError = -1001;
                       gStage = -1;
-                      WriteStatus("memalign-failed");
+                      return;
+                  }
+
+                  int result = socInit(gSocBuffer, SOC_BUFFER_SIZE);
+                  if (result != 0)
+                  {
+                      gLastError = result;
+                      gStage = -2;
+                      free(gSocBuffer);
+                      gSocBuffer = nullptr;
                       return;
                   }
 
                   gStage = 2;
-                  WriteStatus("before-socInit");
-                  Result rc = socInit(gSocBuffer, SOC_BUFFER_SIZE);
-                  if (R_FAILED(rc))
+
+                  while (gShouldRun)
                   {
-                      gLastError = (int)rc;
-                      free(gSocBuffer);
-                      gSocBuffer = nullptr;
-                      gStage = -2;
-                      WriteStatus("socInit-failed");
-                      return;
-                  }
+                      // Artic Base Server waits before creating/recreating
+                      // its listening socket.
+                      svcSleepThread(500 * 1000 * 1000LL);
 
-                  gStage = 3;
-                  WriteStatus("socInit-ok");
-                  gServer = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-                  if (gServer < 0)
-                  {
-                      gLastError = errno;
-                      socExit();
-                      free(gSocBuffer);
-                      gSocBuffer = nullptr;
-                      gStage = -3;
-                      WriteStatus("socket-failed");
-                      return;
-                  }
+                      sockaddr_in serverAddress;
+                      std::memset(&serverAddress, 0, sizeof(serverAddress));
 
-                  int yes = 1;
-                  setsockopt(gServer, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-                  sockaddr_in addr;
-                  std::memset(&addr, 0, sizeof(addr));
-                  addr.sin_family = AF_INET;
-                  addr.sin_port = htons(HTTP_PORT);
-                  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-                  gStage = 4;
-                  WriteStatus("socket-ok-before-bind");
-                  if (bind(gServer, (sockaddr *)&addr, sizeof(addr)) < 0)
-                  {
-                      gLastError = errno;
-                      close(gServer);
-                      gServer = -1;
-                      socExit();
-                      free(gSocBuffer);
-                      gSocBuffer = nullptr;
-                      gStage = -4;
-                      WriteStatus("bind-failed");
-                      return;
-                  }
-
-                  gStage = 5;
-                  WriteStatus("bind-ok-before-listen");
-                  if (listen(gServer, 2) < 0)
-                  {
-                      gLastError = errno;
-                      close(gServer);
-                      gServer = -1;
-                      socExit();
-                      free(gSocBuffer);
-                      gSocBuffer = nullptr;
-                      gStage = -5;
-                      WriteStatus("listen-failed");
-                      return;
-                  }
-
-                  int flags = fcntl(gServer, F_GETFL, 0);
-                  fcntl(gServer, F_SETFL, flags | O_NONBLOCK);
-                  gStage = 6;
-                  WriteStatus("server-ready");
-
-                  while (!gStop)
-                  {
-                      sockaddr_in clientAddr;
-                      socklen_t clientLen = sizeof(clientAddr);
-                      int client = accept(gServer, (sockaddr *)&clientAddr, &clientLen);
-                      if (client >= 0)
+                      gListenFd = socket(AF_INET, SOCK_STREAM, 0);
+                      if (gListenFd < 0)
                       {
-                          HandleClient(client);
-                          close(client);
+                          gLastError = errno;
+                          gStage = -3;
+                          continue;
                       }
-                      svcSleepThread(10 * 1000 * 1000LL);
+
+                      if (!SetNonBlocking(gListenFd))
+                      {
+                          gLastError = errno;
+                          gStage = -4;
+                          close(gListenFd);
+                          gListenFd = -1;
+                          continue;
+                      }
+
+                      serverAddress.sin_family = AF_INET;
+                      serverAddress.sin_addr.s_addr = htonl(INADDR_ANY);
+                      serverAddress.sin_port = htons(HTTP_PORT);
+
+                      if (bind(
+                              gListenFd,
+                              reinterpret_cast<sockaddr *>(&serverAddress),
+                              sizeof(serverAddress)) < 0)
+                      {
+                          gLastError = errno;
+                          gStage = -5;
+                          close(gListenFd);
+                          gListenFd = -1;
+                          continue;
+                      }
+
+                      if (listen(gListenFd, 1) < 0)
+                      {
+                          gLastError = errno;
+                          gStage = -6;
+                          close(gListenFd);
+                          gListenFd = -1;
+                          continue;
+                      }
+
+                      gLastError = 0;
+                      gStage = 6;
+
+                      sockaddr_in peerAddress;
+                      std::memset(&peerAddress, 0, sizeof(peerAddress));
+                      socklen_t peerLength = sizeof(peerAddress);
+
+                      bool restartListener = false;
+
+                      while (gShouldRun)
+                      {
+                          peerLength = sizeof(peerAddress);
+
+                          gAcceptFd = accept(
+                              gListenFd,
+                              reinterpret_cast<sockaddr *>(&peerAddress),
+                              &peerLength);
+
+                          if (gAcceptFd < 0 || peerLength == 0)
+                          {
+                              if ((errno == EWOULDBLOCK || errno == EAGAIN) &&
+                                  gShouldRun)
+                              {
+                                  svcSleepThread(10 * 1000 * 1000LL);
+                                  continue;
+                              }
+
+                              gLastError = errno;
+                              gStage = -7;
+                              restartListener = true;
+                              break;
+                          }
+
+                          break;
+                      }
+
+                      if (gListenFd >= 0)
+                      {
+                          close(gListenFd);
+                          gListenFd = -1;
+                      }
+
+                      if (!gShouldRun)
+                          break;
+
+                      if (restartListener)
+                          continue;
+
+                      if (gAcceptFd >= 0)
+                      {
+                          if (!SetNonBlocking(gAcceptFd))
+                          {
+                              gLastError = errno;
+                              gStage = -8;
+                              close(gAcceptFd);
+                              gAcceptFd = -1;
+                              continue;
+                          }
+
+                          gStage = 7;
+                          HandleClient(gAcceptFd);
+
+                          close(gAcceptFd);
+                          gAcceptFd = -1;
+
+                          // Ready to create a fresh listener for the next
+                          // browser request, matching Artic's reconnect model.
+                          gStage = 2;
+                      }
                   }
 
-                  if (gServer >= 0) { close(gServer); gServer = -1; }
+                  if (gAcceptFd >= 0)
+                  {
+                      close(gAcceptFd);
+                      gAcceptFd = -1;
+                  }
+
+                  if (gListenFd >= 0)
+                  {
+                      close(gListenFd);
+                      gListenFd = -1;
+                  }
+
                   socExit();
-                  if (gSocBuffer) { free(gSocBuffer); gSocBuffer = nullptr; }
+
+                  if (gSocBuffer)
+                  {
+                      free(gSocBuffer);
+                      gSocBuffer = nullptr;
+                  }
+
                   gStage = 0;
               }
 
-              void PatchProcess(FwkSettings &settings) { (void)settings; }
+              void PatchProcess(FwkSettings &settings)
+              {
+                  (void)settings;
+              }
 
               void OnProcessExit(void)
               {
-                  gStop = true;
-                  if (gThread)
+                  gShouldRun = false;
+
+                  if (gAcceptFd >= 0)
                   {
-                      if (R_SUCCEEDED(threadJoin(gThread, 2ULL * 1000ULL * 1000ULL * 1000ULL)))
-                          threadFree(gThread);
-                      gThread = nullptr;
+                      close(gAcceptFd);
+                      gAcceptFd = -1;
+                  }
+
+                  if (gListenFd >= 0)
+                  {
+                      close(gListenFd);
+                      gListenFd = -1;
+                  }
+
+                  if (gServerThread)
+                  {
+                      if (R_SUCCEEDED(threadJoin(
+                              gServerThread,
+                              2ULL * 1000ULL * 1000ULL * 1000ULL)))
+                      {
+                          threadFree(gServerThread);
+                      }
+
+                      gServerThread = nullptr;
                   }
               }
 
               int main(void)
               {
-                  gStop = false;
+                  gShouldRun = true;
                   gStage = 0;
                   gLastError = 0;
 
-                  gThread = threadCreate(ServerWorker, nullptr, 0x10000, 0x30, -2, false);
+                  // Match Artic Base Server: derive worker priority from
+                  // the current thread instead of hardcoding one.
+                  s32 priority = 0;
+                  svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
 
+                  gServerThread = threadCreate(
+                      StartServer,
+                      nullptr,
+                      0x1000,
+                      priority - 1,
+                      -2,
+                      false);
+
+                  // Keep the normal CTRPF lifecycle alive so the game continues
+                  // to execute. Do not open the menu with Select in this build.
                   PluginMenu *menu = new PluginMenu(
-                      "3DS Cast", 0, 3, 3,
-                      "Background HTTP diagnostic.\nDo not press Select during this test.");
+                      "3DS Cast",
+                      0, 4, 0,
+                      "Artic-style network test.\n"
+                      "Do not press Select during this build.");
 
                   menu->SynchronizeWithFrame(true);
                   menu->Run();
 
-                  gStop = true;
-                  if (gThread)
+                  gShouldRun = false;
+
+                  if (gAcceptFd >= 0)
                   {
-                      if (R_SUCCEEDED(threadJoin(gThread, 2ULL * 1000ULL * 1000ULL * 1000ULL)))
-                          threadFree(gThread);
-                      gThread = nullptr;
+                      close(gAcceptFd);
+                      gAcceptFd = -1;
+                  }
+
+                  if (gListenFd >= 0)
+                  {
+                      close(gListenFd);
+                      gListenFd = -1;
+                  }
+
+                  if (gServerThread)
+                  {
+                      if (R_SUCCEEDED(threadJoin(
+                              gServerThread,
+                              2ULL * 1000ULL * 1000ULL * 1000ULL)))
+                      {
+                          threadFree(gServerThread);
+                      }
+
+                      gServerThread = nullptr;
                   }
 
                   delete menu;
@@ -346,33 +569,58 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           cd /tmp/3dscast
           make clean || true
           make -j1
+
           PLUGIN="$(find . -maxdepth 2 -type f -name '*.3gx' -print -quit)"
           test -n "$PLUGIN"
+
           mkdir -p "$GITHUB_WORKSPACE/release"
           cp "$PLUGIN" "$GITHUB_WORKSPACE/release/default.3gx"
           cp CTRPluginFramework.plgInfo "$GITHUB_WORKSPACE/release/CTRPluginFramework.plgInfo"
+
           cat > "$GITHUB_WORKSPACE/release/README.txt" <<'EOF'
-          3DS Cast v0.3.4 Threaded HTTP
+          3DS Cast v0.4 Artic Network
 
-          1. Note the 3DS IP in FTPD.
-          2. Put default.3gx in SD:/luma/plugins/default.3gx
+          This build copies the important networking choices used by
+          Azahar's Artic Base Server:
+          - 4 MiB SOC buffer
+          - worker priority = current priority - 1
+          - worker stack = 0x1000
+          - CPU affinity = -2
+          - 500 ms wait before socket creation
+          - non-blocking listener
+          - bind(INADDR_ANY)
+          - listen + EWOULDBLOCK accept loop
+          - listener recreated after disconnect/error
+
+          TEST:
+          1. Put default.3gx in SD:/luma/plugins/default.3gx
+          2. Enable Luma Plugin Loader.
           3. Launch New Super Mario Bros. 2.
-          4. DO NOT PRESS SELECT.
-          5. Wait for Plugin Ready and 20 seconds.
-          6. Open http://YOUR_3DS_IP:8080/
-          7. Also test http://YOUR_3DS_IP:8080/status
+          4. Wait for "Plugin Ready".
+          5. DO NOT PRESS SELECT.
+          6. Wait about 3 seconds.
+          7. Open on the iPhone:
+             http://YOUR_3DS_IP:8080/
+          8. Also test:
+             http://YOUR_3DS_IP:8080/status
 
-          Expected /status when fully ready:
-          {"ok":true,"version":"0.3.3","stage":6,"error":0}
+          Expected /status while connected:
+          {"ok":true,"version":"0.4.0","stage":7,"error":0}
+
+          NOTE:
+          The listener returns to its waiting state after each request.
           EOF
 
-      - name: Upload 3DS Cast v0.3.4
+          ls -lh "$GITHUB_WORKSPACE/release"
+
+      - name: Upload 3DS Cast v0.4
         uses: actions/upload-artifact@v4
         with:
-          name: 3DS-Cast-v0.3.4-Network-Diagnostic
+          name: 3DS-Cast-v0.4.0-Artic-Network
           path: release/
           if-no-files-found: error
           retention-days: 30
