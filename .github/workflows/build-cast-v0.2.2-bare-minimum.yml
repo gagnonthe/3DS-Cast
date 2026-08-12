@@ -1,0 +1,206 @@
+name: 3DS Cast v0.2.2 Bare Minimum
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitarm:20260610
+
+    env:
+      DEVKITPRO: /opt/devkitpro
+      DEVKITARM: /opt/devkitpro/devkitARM
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git cmake g++ ca-certificates
+
+      - name: Build CTRPluginFramework 0.8.0
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf /tmp/ctrpf-src /tmp/ctrpf-dist
+          git clone --recursive --depth 1 --branch 0.8.0             https://gitlab.com/thepixellizeross/ctrpluginframework.git             /tmp/ctrpf-src
+
+          cd /tmp/ctrpf-src/Library
+
+          PATCHED=0
+          for f in $(find . -maxdepth 2 -type f \( -name 'Makefile' -o -name '*.mk' \) -print); do
+            if grep -q -- '-Werror' "$f"; then
+              sed -i 's/-Werror/-Werror -Wno-error=unused-but-set-variable/g' "$f"
+              PATCHED=1
+            fi
+          done
+          test "$PATCHED" -eq 1
+
+          make clean || true
+          make -j1
+          make dist-bin
+
+          ARCHIVE="$(find . -maxdepth 2 -type f \( -name '*.tar.bz2' -o -name '*.tar.gz' -o -name '*.tar' \) -print -quit)"
+          test -n "$ARCHIVE"
+
+          mkdir -p /tmp/ctrpf-dist
+          tar -xf "$ARCHIVE" -C /tmp/ctrpf-dist
+
+          ROOT="$(find /tmp/ctrpf-dist -type d -name include -printf '%h\n' | while read -r d; do if [ -d "$d/lib" ]; then echo "$d"; break; fi; done)"
+          test -n "$ROOT"
+
+          rm -rf /opt/devkitpro/libctrpf
+          mkdir -p /opt/devkitpro/libctrpf
+          cp -a "$ROOT/include" "$ROOT/lib" /opt/devkitpro/libctrpf/
+
+      - name: Build 3gxtool 1.3
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf /tmp/3gxtool
+          git clone --recursive --depth 1 --branch v1.3             https://gitlab.com/thepixellizeross/3gxtool.git             /tmp/3gxtool
+
+          cmake -S /tmp/3gxtool -B /tmp/3gxtool/build
+          cmake --build /tmp/3gxtool/build -j2
+
+          test -x /tmp/3gxtool/build/3gxtool
+          install -m 0755 /tmp/3gxtool/build/3gxtool /usr/local/bin/3gxtool
+
+      - name: Prepare bare minimum plugin
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf /tmp/3dscast
+          git clone --depth 1 --branch v0.8.0             https://github.com/PabloMK7/CTRPluginFramework-BlankTemplate.git             /tmp/3dscast
+
+          rm -rf /tmp/3dscast/.git /tmp/3dscast/.github
+
+          cat > /tmp/3dscast/CTRPluginFramework.plgInfo <<'EOF'
+          Author: 3DS Cast
+
+          Version:
+              Major: 0
+              Minor: 2
+              Revision: 2
+
+          Targets:
+
+          Title: 3DS Cast Bare Minimum
+
+          Summary: Minimal CTRPF loading test
+
+          Description: |
+            Bare minimum diagnostic build.
+            No private memory.
+            No network.
+            No sockets.
+            No custom threads.
+            No menu entries.
+            No message boxes.
+
+          Compatibility: Any
+
+          MemorySize: 5MiB
+
+          UsePrivateMemory: false
+          EOF
+
+          cat > /tmp/3dscast/Sources/main.cpp <<'EOF'
+          #include <CTRPluginFramework.hpp>
+
+          namespace CTRPluginFramework
+          {
+              void PatchProcess(FwkSettings &settings)
+              {
+                  (void)settings;
+              }
+
+              void OnProcessExit(void)
+              {
+              }
+
+              int main(void)
+              {
+                  PluginMenu *menu = new PluginMenu(
+                      "3DS Cast",
+                      0, 2, 2,
+                      "Bare minimum diagnostic build.");
+
+                  menu->SynchronizeWithFrame(true);
+
+                  // Intentionally no MenuEntry, no MessageBox,
+                  // no networking and no custom thread.
+                  menu->Run();
+
+                  delete menu;
+                  return 0;
+              }
+          }
+          EOF
+
+      - name: Build plugin
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd /tmp/3dscast
+          make clean || true
+          make -j1
+
+          PLUGIN="$(find . -maxdepth 2 -type f -name '*.3gx' -print -quit)"
+          test -n "$PLUGIN"
+
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          cp "$PLUGIN" "$GITHUB_WORKSPACE/release/default.3gx"
+          cp CTRPluginFramework.plgInfo "$GITHUB_WORKSPACE/release/CTRPluginFramework.plgInfo"
+
+          cat > "$GITHUB_WORKSPACE/release/README.txt" <<'EOF'
+          3DS Cast v0.2.2 Bare Minimum
+
+          TEST GOAL:
+          Determine whether New Super Mario Bros. 2 can stay running with the
+          smallest possible CTRPluginFramework plugin.
+
+          This build has:
+          - UsePrivateMemory: false
+          - no network
+          - no sockets
+          - no custom worker thread
+          - no MenuEntry
+          - no MessageBox
+
+          TEST:
+          1. Copy default.3gx to SD:/luma/plugins/default.3gx
+          2. Ensure Luma Plugin Loader is enabled.
+          3. Launch New Super Mario Bros. 2.
+          4. Do NOT press Select immediately.
+          5. Let the game run for at least 30 seconds.
+          6. If it stays stable, press Select once to see whether the empty CTRPF menu opens.
+
+          Report whether:
+          A) it crashes before Select
+          B) it crashes when Select is pressed
+          C) it stays stable
+          EOF
+
+          ls -lh "$GITHUB_WORKSPACE/release"
+
+      - name: Upload bare minimum plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3DS-Cast-v0.2.2-Bare-Minimum
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
